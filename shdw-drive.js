@@ -185,10 +185,7 @@ programCommand("edit-file")
     if (fileStats.size > 1073741824 * 1) {
         fileErrors.push({
             file: fileName,
-            erorr: "Exceeds the 1GB limit.", //Its because of the nodejs file buffer limit. 
-                                            //That can be lifted up to about 1.9gb before we have to write 
-                                            //a new way of reading buffers in JS that’s a bit more
-                                            // complex than just fs.readFile
+            erorr: "Exceeds the 1GB limit.",
         });
     }
     const fileNameBytes = new TextEncoder().encode(fileName).length;
