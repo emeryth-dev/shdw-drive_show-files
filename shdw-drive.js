@@ -23,6 +23,17 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
+var __rest = (this && this.__rest) || function (s, e) {
+    var t = {};
+    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
+        t[p] = s[p];
+    if (s != null && typeof Object.getOwnPropertySymbols === "function")
+        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) {
+            if (e.indexOf(p[i]) < 0 && Object.prototype.propertyIsEnumerable.call(s, p[i]))
+                t[p[i]] = s[p[i]];
+        }
+    return t;
+};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -30,27 +41,29 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const crypto_1 = __importDefault(require("crypto"));
 const fs = __importStar(require("fs"));
 const mime_types_1 = __importDefault(require("mime-types"));
+const ora_1 = __importDefault(require("ora"));
 const path = __importStar(require("path"));
 const prompts_1 = __importDefault(require("prompts"));
-const ora_1 = __importDefault(require("ora"));
 const anchor = __importStar(require("@project-serum/anchor"));
 const spl_token_1 = require("@solana/spl-token");
+const web3_js_1 = require("@solana/web3.js");
 const commander_1 = require("commander");
 const form_data_1 = __importDefault(require("form-data"));
 const loglevel_1 = __importDefault(require("loglevel"));
 const node_fetch_1 = __importDefault(require("node-fetch"));
 const constants_1 = require("./constants");
 const helpers_1 = require("./helpers");
-const web3_js_1 = require("@solana/web3.js");
 const transaction_1 = require("./helpers/transaction");
+const rxjs_1 = require("rxjs");
+const cli_progress_1 = __importDefault(require("cli-progress"));
 const SHDW_DECIMALS = 9;
 const tokenMint = new anchor.web3.PublicKey("SHDWyBxihqiCj6YekG2GUr7wqKLeLAMK1gHZck9pL6y");
 const uploaderPubkey = new anchor.web3.PublicKey("972oJTFyjmVNsWM4GHEGPWUomAiJf2qrVotLtwnKmWem");
 const emissionsPubkey = new anchor.web3.PublicKey("SHDWRWMZ6kmRG9CvKFSD7kVcnUqXMtd3SaMrLvWscbj");
-commander_1.program.version("0.0.24");
+commander_1.program.version("0.1.1");
 commander_1.program.description("CLI for interacting with Shade Drive. This tool uses Solana's Mainnet-Beta network with an internal RPC configuration. It does not use your local Solana configurations.");
 loglevel_1.default.setLevel(loglevel_1.default.levels.INFO);
-loglevel_1.default.info("This is beta software. Use at your own discretion.");
+loglevel_1.default.info("This is beta software running on Solana's Mainnet. Use at your own discretion.");
 programCommand("create-storage-account")
     .requiredOption("-kp, --keypair <string>", "Path to wallet that will create the storage account")
     .requiredOption("-n, --name <string>", "What you want your storage account to be named. (Does not have to be unique)")
@@ -58,7 +71,7 @@ programCommand("create-storage-account")
     .action(async (options, cmd) => {
     const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
     const storageConfigInfo = await programClient.account.storageConfig.fetch(storageConfig);
     let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
@@ -86,12 +99,17 @@ programCommand("create-storage-account")
         loglevel_1.default.error(`${options.size} is not a valid input for size. Please use a string like '1KB', '1MB', '1GB'.`);
         return;
     }
-    let shadesPerGb = storageConfigInfo.shadesPerGib.toNumber();
-    const accountCostEstimate = Number(storageInputAsBytes) / 10 ** 9;
+    const shadesPerGib = storageConfigInfo.shadesPerGib;
+    const storageInputBigInt = new anchor.BN(Number(storageInputAsBytes));
+    const bytesPerGib = new anchor.BN(constants_1.BYTES_PER_GIB);
+    const accountCostEstimate = storageInputBigInt
+        .mul(shadesPerGib)
+        .div(bytesPerGib);
+    const accountCostUiAmount = accountCostEstimate.toNumber() / 10 ** 9;
     const confirmStorageCost = await (0, prompts_1.default)({
         type: "confirm",
         name: "acceptStorageCost",
-        message: `This storage account will require an estimated ${accountCostEstimate} SHDW to setup. Would you like to continue?`,
+        message: `This storage account will require an estimated ${accountCostUiAmount} SHDW to setup. Would you like to continue?`,
         initial: false,
     });
     if (!confirmStorageCost.acceptStorageCost) {
@@ -115,7 +133,7 @@ programCommand("create-storage-account")
     loglevel_1.default.debug("stakeAccount:", stakeAccount);
     loglevel_1.default.debug("Sending off initializeAccount tx");
     const txn = await programClient.methods
-        .initializeAccount(identifier, storageRequested, null)
+        .initializeAccount2(identifier, storageRequested)
         .accounts({
         storageConfig,
         userInfo,
@@ -130,7 +148,9 @@ programCommand("create-storage-account")
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
     })
         .transaction();
-    txn.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+    const recentBlockhash = await connection.getLatestBlockhash("max");
+    const blockHeight = await connection.getBlockHeight();
+    txn.recentBlockhash = (await connection.getLatestBlockhash("max")).blockhash;
     txn.feePayer = keypair.publicKey;
     txn.partialSign(keypair);
     const serializedTxn = txn.serialize({ requireAllSignatures: false });
@@ -176,7 +196,7 @@ programCommand("edit-file")
     .action(async (options, cmd) => {
     const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     const logOutputDirectory = options.outFileLocation || __dirname;
     let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
     const fileStats = fs.statSync(options.file);
@@ -186,13 +206,6 @@ programCommand("edit-file")
         fileErrors.push({
             file: fileName,
             erorr: "Exceeds the 1GB limit.",
-        });
-    }
-    const fileNameBytes = new TextEncoder().encode(fileName).length;
-    if (fileNameBytes > 32) {
-        fileErrors.push({
-            file: fileName,
-            error: "File name too long. Reduce to 32 bytes long.",
         });
     }
     if (fileErrors.length) {
@@ -221,12 +234,23 @@ programCommand("edit-file")
     if (fileOwnerOnChain.toBase58() != keypair.publicKey.toBase58()) {
         return loglevel_1.default.error("Permission denied: Not file owner");
     }
-    const file = new anchor.web3.PublicKey(fileDataResponse.file_data["file-account-pubkey"]);
     const storageAccount = new anchor.web3.PublicKey(fileDataResponse.file_data["storage-account-pubkey"]);
-    const fileAccountOnChain = await programClient.account.file.fetch(file);
-    const storageAccountOnChain = await programClient.account.storageAccount.fetch(storageAccount);
+    const storageAccountType = await (0, helpers_1.validateStorageAccount)(storageAccount, connection);
+    if (!storageAccountType || storageAccountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount.toString()} is not a valid Shadow Drive Storage Account.`);
+    }
+    let storageAccountOnChain;
+    if (storageAccountType === "V1") {
+        storageAccountOnChain =
+            await programClient.account.storageAccount.fetch(storageAccount);
+    }
+    if (storageAccountType === "V2") {
+        storageAccountOnChain =
+            await programClient.account.storageAccountV2.fetch(storageAccount);
+    }
+    loglevel_1.default.debug({ storageAccountOnChain });
     let userInfoData = await programClient.account.userInfo.fetch(userInfo);
-    loglevel_1.default.debug("userInfoData", userInfoData);
+    loglevel_1.default.debug({ userInfoData });
     const fd = new form_data_1.default();
     fd.append("file", fileData, {
         contentType: fileContentType,
@@ -248,26 +272,19 @@ programCommand("edit-file")
         size,
         storageConfig: storageConfig.toString(),
         storageAccount: storageAccount.toString(),
-        file: file.toString(),
     });
-    const txn = await programClient.methods
-        .editFile(sha256Hash, size)
-        .accounts({
-        storageConfig: storageConfig,
-        storageAccount: storageAccount,
-        file: file,
-        owner: keypair.publicKey,
-        uploader: uploaderPubkey,
-        tokenMint: tokenMint,
-        systemProgram: anchor.web3.SystemProgram.programId,
-    })
-        .transaction();
-    txn.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-    txn.feePayer = keypair.publicKey;
-    txn.partialSign(keypair);
-    const serializedTxn = txn.serialize({ requireAllSignatures: false });
-    fd.append("transaction", Buffer.from(serializedTxn.toJSON().data).toString("base64"));
-    const txnSpinner = (0, ora_1.default)(`Sending file edit request to the cluster. Subject to solana traffic conditions (w/ 120s timeout).`).start();
+    let msg = `Shadow Drive Signed Message:\n StorageAccount: ${storageAccount.toString()}\nFile to edit: ${fileName}\nNew file hash: ${sha256Hash}`;
+    const signature = (0, helpers_1.signMessage)(msg, keypair);
+    fd.append("signer", keypair.publicKey.toString());
+    fd.append("message", signature);
+    fd.append("storage_account", storageAccount.toString());
+    try {
+    }
+    catch (e) {
+        loglevel_1.default.error("Error with request");
+        loglevel_1.default.error(e);
+    }
+    const txnSpinner = (0, ora_1.default)(`Sending file edit request to the cluster.`).start();
     try {
         const uploadResponse = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/edit`, {
             method: "POST",
@@ -281,13 +298,9 @@ programCommand("edit-file")
         }
         const responseJson = await uploadResponse.json();
         loglevel_1.default.debug(responseJson);
-        let fileAccount = await programClient.account.file.fetch(file);
-        txnSpinner.succeed(`File account updated: ${file.toString()}`);
+        txnSpinner.succeed(`File account updated: ${fileName}`);
         loglevel_1.default.info("Your finalized file location:", responseJson.finalized_location);
-        loglevel_1.default.info(`Your Solana transaction signature: ${responseJson.transaction_signature}`);
-        loglevel_1.default.info("Please allow 1-2 minutes for your data to be fully finalized on chain on Solana. Your files are immediately accessible.");
-        loglevel_1.default.debug("Your file account values:");
-        loglevel_1.default.debug({ fileAccount });
+        loglevel_1.default.info("Your updated file is immediately accessible.");
     }
     catch (e) {
         txnSpinner.fail(e.message);
@@ -296,11 +309,9 @@ programCommand("edit-file")
 async function handleUpload(options, cmd, mode) {
     const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     const programLogPath = path.join(process.cwd(), `shdw-drive-upload-${Math.round(new Date().getTime() / 100)}.json`);
     loglevel_1.default.info(`Writing upload logs to ${programLogPath}.`);
-    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
-    let totalBytesToUpload = 0;
     let filesToRead = mode === "directory"
         ? fs.readdirSync(path.resolve(options.directory))
         : [path.resolve(options.file)];
@@ -318,14 +329,6 @@ async function handleUpload(options, cmd, mode) {
             fileErrors.push({
                 file: fileName,
                 error: `Exceeds the 1GB file size limit`,
-            });
-        }
-        totalBytesToUpload += fileStats.size;
-        const fileNameBytes = new TextEncoder().encode(fileName).length;
-        if (fileNameBytes >= 32) {
-            fileErrors.push({
-                file: fileName,
-                error: "File name too long. Reduce to less than 32 bytes long.",
             });
         }
         const fileExtension = fileName.substring(fileName.lastIndexOf(".") + 1);
@@ -347,7 +350,7 @@ async function handleUpload(options, cmd, mode) {
     });
     fileSpinner.succeed();
     if (fileErrors.length) {
-        loglevel_1.default.error("There were issues with some of th files. See below for more details.");
+        loglevel_1.default.error("There were issues with some of the files. See below for more details.");
         return loglevel_1.default.error(fileErrors);
     }
     let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
@@ -366,27 +369,42 @@ async function handleUpload(options, cmd, mode) {
         ], programClient.programId);
         accountsToFetch.push(acc);
     }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
-    accountsToFetch.forEach((accountPubkey, i) => {
-        if (accounts[i]) {
-            accounts[i].pubkey = accountPubkey;
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
         }
-    });
+        return storageAccountDetailsJson;
+    }));
+    loglevel_1.default.debug("accounts", accounts);
     let alist1 = accounts.map((account, idx) => {
         return {
             identifier: account === null || account === void 0 ? void 0 : account.identifier,
             totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
                 : null,
             storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
                 : null,
-            pubkey: accountsToFetch[idx],
-            hasEnoughStorageForFile: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? totalBytesToUpload < account.storageAvailable
+            pubkey: account.storage_account,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            creation_time: (account === null || account === void 0 ? void 0 : account.identifier) ? account.creation_time : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
                 : null,
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
-            initCounter: (account === null || account === void 0 ? void 0 : account.identifier) ? account.initCounter : null,
         };
     });
     let formattedAccounts = alist1.filter((acc, idx) => {
@@ -394,8 +412,10 @@ async function handleUpload(options, cmd, mode) {
             return acc;
         }
     });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
     let storageAccount;
     let storageAccountData;
+    debugger;
     if (!options.storageAccount) {
         const pickedAccount = await (0, prompts_1.default)({
             type: "select",
@@ -404,8 +424,7 @@ async function handleUpload(options, cmd, mode) {
             warn: "Not enough storage available on this account or the account is marked for deletion",
             choices: formattedAccounts.map((acc) => {
                 return {
-                    title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
-                    disabled: !acc.hasEnoughStorageForFile || acc.toBeDeleted,
+                    title: `${acc.identifier} - ${acc.pubkey} - ${acc.storageAvailable} available - ${acc.version}`,
                 };
             }),
         });
@@ -418,7 +437,7 @@ async function handleUpload(options, cmd, mode) {
     }
     else {
         storageAccount = new web3_js_1.PublicKey(options.storageAccount);
-        storageAccountData = accounts.find((account) => {
+        storageAccountData = alist1.find((account) => {
             if (account &&
                 account.pubkey &&
                 account.pubkey instanceof web3_js_1.PublicKey) {
@@ -467,7 +486,6 @@ async function handleUpload(options, cmd, mode) {
     fs.writeFileSync(programLogPath, JSON.stringify(existingFiles));
     let chunks = [];
     let indivChunk = [];
-    let chunkIdx = 0;
     function getChunkLength(array1, array2) {
         let starting = array1.length;
         if (array2.length) {
@@ -485,12 +503,7 @@ async function handleUpload(options, cmd, mode) {
             }
             continue;
         }
-        let fileNames = indivChunk.map((c) => fileData[c].fileName);
-        const namesLength = Buffer.byteLength(Buffer.from(fileNames));
-        const currentNameBufferLength = Buffer.byteLength(Buffer.from(fileData[chunkIdx].fileName));
-        if (indivChunk.length < 5 &&
-            namesLength < 154 &&
-            currentNameBufferLength + namesLength < 154) {
+        if (indivChunk.length < 5) {
             indivChunk.push(chunkIdx);
             if (chunkIdx == fileData.length - 1) {
                 chunks.push(indivChunk);
@@ -507,191 +520,101 @@ async function handleUpload(options, cmd, mode) {
             }
         }
     }
+    const allFileNames = fileData.map((file) => file.fileName);
+    const hashSum = crypto_1.default.createHash("sha256");
+    hashSum.update(allFileNames.toString());
+    const fileNamesHashed = hashSum.digest("hex");
     loglevel_1.default.debug("finished building chunks", chunks);
-    let previousSeed = storageAccountData.initCounter;
     let newFileSeedToSet = storageAccountData.initCounter;
-    let uploadLogs = [];
-    for (let i = 0; i < chunks.length; i++) {
-        let indivChunk = chunks[i];
-        let actualFiles = [];
-        let fileNames = [];
-        let sha256Hashs = [];
-        let createds = [];
-        let sizes = [];
-        let fileAccounts = [];
-        let fileSeeds = [];
-        let [userInfo] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
-        loglevel_1.default.debug("Processing chunk:", i + 1);
-        for (let j = 0; j <= indivChunk.length - 1; j++) {
-            let index = indivChunk[j];
-            const { fileName, fileExtension, fileStats, contentType, creationDate, size, created, url, } = fileData[index];
-            let fileSeed = new anchor.BN(newFileSeedToSet);
-            let [fileAccount, fileBump] = await anchor.web3.PublicKey.findProgramAddress([
-                storageAccount.toBytes(),
-                new anchor.BN(fileSeed)
-                    .toTwos(64)
-                    .toArrayLike(Buffer, "le", 4),
-            ], programClient.programId);
-            fileNames.push(fileName);
-            createds.push(created);
-            sizes.push(size);
-            fileAccounts.push({ fileAccount, seed: fileSeed });
-            fileSeeds.push(fileSeed);
-            const currentFilePath = mode === "directory"
-                ? path.resolve(options.directory, fileName)
-                : options.file;
-            let data = fs.readFileSync(currentFilePath);
-            const hashSum = crypto_1.default.createHash("sha256");
-            hashSum.update(data);
-            const sha256Hash = hashSum.digest("hex");
-            sha256Hashs.push(sha256Hash);
-            actualFiles.push({
-                fileName,
-                fileExtension,
-                data,
-                fileStats,
-                contentType,
-                sha256Hash,
-                creationDate,
-                size,
-                created,
-                url,
+    let existingUploadJSON = JSON.parse(fs.readFileSync(programLogPath, "utf-8"));
+    const logPath = path.join(process.cwd(), `shdw-drive-upload-${Math.round(new Date().getTime() / 1000)}.json`);
+    if (!chunks.length) {
+        loglevel_1.default.info("All files already uploaded!");
+        process.exit(1);
+    }
+    const concurrent = options.concurrent ? parseInt(options.concurrent) : 3;
+    const appendFileToItem = (item) => {
+        const { fileName } = item, props = __rest(item, ["fileName"]);
+        const currentFilePath = mode === "directory"
+            ? path.resolve(options.directory, fileName)
+            : options.file;
+        let data = fs.readFileSync(currentFilePath);
+        return Object.assign(Object.assign({}, props), { fileName,
+            data });
+    };
+    loglevel_1.default.info(`Starting upload of ${allFileNames.length} files to ${storageAccount} with concurrency ${concurrent}`);
+    const progress = new cli_progress_1.default.SingleBar({
+        format: "Upload Progress | {bar} | {percentage}% || {value}/{total} Files",
+        barCompleteChar: "\u2588",
+        barIncompleteChar: "\u2591",
+        hideCursor: true,
+    });
+    progress.start(allFileNames.length, 0);
+    (0, rxjs_1.from)(chunks)
+        .pipe((0, rxjs_1.map)((indivChunk) => {
+        return indivChunk.map((index) => appendFileToItem(fileData[index]));
+    }), (0, rxjs_1.mergeMap)(async (items) => {
+        const fd = new form_data_1.default();
+        for (const item of items) {
+            fd.append("file", item.data, {
+                contentType: item.contentType,
+                filename: item.fileName,
             });
-            previousSeed = fileSeed.toNumber();
-            newFileSeedToSet = fileSeed.toNumber() + 1;
+            console.log(fd);
+
         }
-        let sortedFileAccounts = fileAccounts.sort((0, helpers_1.sortByProperty)("seed"));
-        let continueToNextBatch = false;
-        let currentRetries = 0;
-        let accountReadyForNextTransaction = false;
-        loglevel_1.default.info("Waiting for the Solana chain to have the most up to date storage account information...");
-        let updatedStorageAccount;
-        while (!accountReadyForNextTransaction) {
-            updatedStorageAccount =
-                await programClient.account.storageAccount.fetch(storageAccount);
-            loglevel_1.default.debug("Expected next file seed on chain to be:", sortedFileAccounts[0].seed.toNumber());
-            loglevel_1.default.debug("Actual next file seed on chain:", updatedStorageAccount.initCounter);
-            if (updatedStorageAccount.initCounter ==
-                sortedFileAccounts[0].seed.toNumber()) {
-                loglevel_1.default.debug("Chain has up to date info. Moving onto the next batch.");
-                accountReadyForNextTransaction = true;
-            }
-            else {
-                loglevel_1.default.debug("Chain does not have up to date info. Waiting 1s to check again.");
-            }
-            await (0, helpers_1.sleep)(1000);
+        const msg = `Shadow Drive Signed Message:\nStorage Account: ${storageAccount}\nUpload files with hash: ${fileNamesHashed}`;
+        const signature = (0, helpers_1.signMessage)(msg, keypair);
+        fd.append("message", signature);
+        fd.append("signer", keypair.publicKey.toString());
+        fd.append("storage_account", storageAccount);
+        fd.append("fileNames", allFileNames.toString());
+        const response = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/upload`, {
+            method: "POST",
+            body: fd,
+        });
+        if (!response.ok) {
+            const error = (await response.json()).error;
+            loglevel_1.default.info("Error processing transaction. See below for details:");
+            loglevel_1.default.error(`Server response status code: ${response.status}`);
+            loglevel_1.default.error(`Server response status message: ${error}`);
+            return items.map((item) => ({
+                fileName: item.fileName,
+                status: `Not uploaded: ${error}`,
+                location: null,
+            }));
         }
-        let existingUploadJSON = JSON.parse(fs.readFileSync(programLogPath, "utf-8"));
-        while (!continueToNextBatch) {
-            const txnSpinner = (0, ora_1.default)("Sending batch file txn").start();
-            try {
-                const txn = await programClient.methods
-                    .storeFile(fileNames[0], sha256Hashs[0], sizes[0])
-                    .accounts({
-                    storageConfig,
-                    storageAccount,
-                    userInfo,
-                    owner: keypair.publicKey,
-                    uploader: uploaderPubkey,
-                    tokenMint: tokenMint,
-                    systemProgram: anchor.web3.SystemProgram.programId,
-                    file: sortedFileAccounts[0].fileAccount,
-                })
-                    .transaction();
-                for (let fileIx = 1; fileIx < fileNames.length; fileIx++) {
-                    const ixn = await programClient.methods
-                        .storeFile(fileNames[fileIx], sha256Hashs[fileIx], sizes[fileIx])
-                        .accounts({
-                        storageConfig,
-                        storageAccount,
-                        userInfo,
-                        owner: keypair.publicKey,
-                        uploader: uploaderPubkey,
-                        tokenMint: tokenMint,
-                        systemProgram: anchor.web3.SystemProgram.programId,
-                        file: sortedFileAccounts[fileIx].fileAccount,
-                    })
-                        .instruction();
-                    txn.add(ixn);
-                }
-                txn.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-                txn.feePayer = keypair.publicKey;
-                txn.partialSign(keypair);
-                const serializedTxn = txn.serialize({
-                    requireAllSignatures: false,
-                });
-                const fd = new form_data_1.default();
-                for (let j = 0; j < actualFiles.length; j++) {
-                    fd.append("file", actualFiles[j].data, {
-                        contentType: actualFiles[j].contentType,
-                        filename: actualFiles[j].fileName,
-                    });
-                }
-                fd.append("transaction", Buffer.from(serializedTxn.toJSON().data).toString("base64"));
-                const request = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/upload-batch`, {
-                    method: "POST",
-                    body: fd,
-                });
-                if (!request.ok) {
-                    const error = (await request.json()).error;
-                    txnSpinner.fail("Error processing transaction. See below for details:");
-                    loglevel_1.default.error(`Server response status code: ${request.status}`);
-                    loglevel_1.default.error(`Server response status message: ${error}`);
-                    if (error.toLowerCase().includes("timed out") ||
-                        error.toLowerCase().includes("blockhash") ||
-                        error.toLowerCase().includes("unauthorized signer") ||
-                        error.toLowerCase().includes("node is behind") ||
-                        error.toLowerCase().includes("was not confirmed in")) {
-                        currentRetries += 1;
-                        loglevel_1.default.error(`Transaction Retry #${currentRetries}`);
-                    }
-                    else {
-                        newFileSeedToSet = updatedStorageAccount.initCounter;
-                        fileNames.map((name, idx) => {
-                            existingUploadJSON.push({
-                                fileName: name,
-                                status: `Not uploaded: ${error}`,
-                                location: null,
-                            });
-                        });
-                        continueToNextBatch = true;
-                    }
-                }
-                else {
-                    const responseJson = await request.json();
-                    txnSpinner.succeed();
-                    loglevel_1.default.info(`Solana transaction signature: ${responseJson.transaction_signature}`);
-                    fileNames.map((name, idx) => {
-                        existingUploadJSON.push({
-                            fileName: name,
-                            status: "Uploaded.",
-                            location: actualFiles[idx].url,
-                        });
-                    });
-                    continueToNextBatch = true;
-                }
-            }
-            catch (e) {
-                loglevel_1.default.error(e);
-                fileNames.map((name, idx) => {
+        else {
+            const responseJson = await response.json();
+            if (responseJson.upload_errors.length) {
+                responseJson.upload_errors.map((error) => {
                     existingUploadJSON.push({
-                        fileName: name,
-                        status: `Not uploaded: ${e}`,
+                        fileName: error.file,
+                        status: `Not uploaded: ${error.error}`,
                         location: null,
                     });
                 });
-                continueToNextBatch = true;
-                newFileSeedToSet = updatedStorageAccount.initCounter;
             }
+            loglevel_1.default.debug(responseJson);
+            loglevel_1.default.debug(`Message signature: ${responseJson.message}`);
+            return items.map((item) => ({
+                fileName: item.fileName,
+                status: "Uploaded.",
+                location: item.url,
+            }));
         }
-        fs.writeFileSync(programLogPath, JSON.stringify(existingUploadJSON));
-        await (0, helpers_1.sleep)(500);
-    }
+    }, concurrent), (0, rxjs_1.tap)((res) => progress.increment(res.length)), (0, rxjs_1.toArray)(), (0, rxjs_1.map)((res) => res.flat()))
+        .subscribe((results) => {
+        fs.writeFileSync(logPath, JSON.stringify(results));
+        loglevel_1.default.info(`${results.length} files uploaded.`);
+        progress.stop();
+    });
 }
 programCommand("upload-multiple-files")
     .requiredOption("-kp, --keypair <string>", "Path to wallet that will upload the files")
     .requiredOption("-d, --directory <string>", "Path to folder of files you want to upload.")
     .option("-s, --storage-account <string>", "Storage account to upload file to.")
+    .option("-c, --concurrent <number>", "Number of concurrent batch uploads.", "3")
     .action(async (options, cmd) => {
     await handleUpload(options, cmd, "directory");
 });
@@ -702,9 +625,8 @@ programCommand("delete-file")
     const keypair = (0, helpers_1.loadWalletKey)(path.resolve(options.keypair));
     loglevel_1.default.debug("Input params:", { options });
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
-    loglevel_1.default.info(`Retreiving the storage account associated with the file ${options.url}`);
     const fileData = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/get-object-data`, {
         method: "POST",
         headers: {
@@ -715,96 +637,58 @@ programCommand("delete-file")
         }),
     });
     const fileDataResponse = await fileData.json();
-    const fileOwnerOnChain = new anchor.web3.PublicKey(fileDataResponse.file_data["owner-account-pubkey"]);
-    if (fileOwnerOnChain.toBase58() != keypair.publicKey.toBase58()) {
-        return loglevel_1.default.error("Permission denied: Not file owner");
+    loglevel_1.default.debug({ fileDataResponse });
+    if (fileDataResponse.error ||
+        !fileDataResponse.file_data["owner-account-pubkey"]) {
+        return loglevel_1.default.error("File does not exist");
     }
-    const fileAccount = new anchor.web3.PublicKey(fileDataResponse.file_data["file-account-pubkey"]);
-    const storageAccount = new anchor.web3.PublicKey(fileDataResponse.file_data["storage-account-pubkey"]);
-    const fileAccountOnChain = await programClient.account.file.fetch(fileAccount);
-    const storageAccountOnChain = await programClient.account.storageAccount.fetch(storageAccount);
-    loglevel_1.default.debug({ fileAccountOnChain });
-    loglevel_1.default.debug({ storageAccountOnChain });
-    const txnSpinner = (0, ora_1.default)("Sending delete file request. Subject to solana traffic conditions (w/ 120s timeout).").start();
-    try {
-        const transaction = await programClient.methods
-            .requestDeleteFile()
-            .accounts({
-            storageConfig,
-            storageAccount,
-            file: fileAccount,
-            owner: keypair.publicKey,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
-    }
-    catch (e) {
-        txnSpinner.fail("Failed to submit delete file request. See below for details:");
-        return loglevel_1.default.error(e);
-    }
-    txnSpinner.succeed(`File account delete request submitted for ${options.url}. You have until the end of the current Solana Epoch to revert your deletion request. Once the account is fully deleted, you will receive the SOL rent and SHDW staked back in your wallet.`);
-    return;
-});
-programCommand("undelete-file")
-    .requiredOption("-kp, --keypair <string>", "Path to the keypair file for the wallet that owns the storage account and file")
-    .requiredOption("-u, --url <string>", "Shadow Drive URL of the file you are requesting to delete.")
-    .action(async (options, cmd) => {
-    const keypair = (0, helpers_1.loadWalletKey)(path.resolve(options.keypair));
-    loglevel_1.default.debug("Input params:", { options });
-    const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
-    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
     loglevel_1.default.info(`Retreiving the storage account associated with the file ${options.url}`);
-    const fileData = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/get-object-data`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            location: options.url,
-        }),
-    });
-    const fileDataResponse = await fileData.json();
     const fileOwnerOnChain = new anchor.web3.PublicKey(fileDataResponse.file_data["owner-account-pubkey"]);
     if (fileOwnerOnChain.toBase58() != keypair.publicKey.toBase58()) {
         return loglevel_1.default.error("Permission denied: Not file owner");
     }
-    const fileAccount = new anchor.web3.PublicKey(fileDataResponse.file_data["file-account-pubkey"]);
     const storageAccount = new anchor.web3.PublicKey(fileDataResponse.file_data["storage-account-pubkey"]);
-    const fileAccountOnChain = await programClient.account.file.fetch(fileAccount);
-    const storageAccountOnChain = await programClient.account.storageAccount.fetch(storageAccount);
-    let [stakeAccount, stakeAccountBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
-    loglevel_1.default.debug({ fileAccountOnChain });
+    const storageAccountType = await (0, helpers_1.validateStorageAccount)(storageAccount, connection);
+    if (!storageAccountType || storageAccountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount.toString()} is not a valid Shadow Drive Storage Account.`);
+    }
+    let storageAccountOnChain;
+    if (storageAccountType === "V1") {
+        storageAccountOnChain =
+            await programClient.account.storageAccount.fetch(storageAccount);
+    }
+    if (storageAccountType === "V2") {
+        storageAccountOnChain =
+            await programClient.account.storageAccountV2.fetch(storageAccount);
+    }
     loglevel_1.default.debug({ storageAccountOnChain });
-    const txnSpinner = (0, ora_1.default)("Sending undelete file request. Subject to solana traffic conditions (w/ 120s timeout).").start();
+    let storageAccountOwner = new anchor.web3.PublicKey(storageAccountOnChain.owner1);
+    if (!storageAccountOwner.equals(keypair.publicKey)) {
+        loglevel_1.default.error("Permission denied: Not file owner");
+    }
+    const msg = `Shadow Drive Signed Message:\nStorageAccount: ${storageAccount.toString()}\nFile to delete: ${options.url}`;
+    const signature = (0, helpers_1.signMessage)(msg, keypair);
     try {
-        const transaction = await programClient.methods
-            .unmarkDeleteFile()
-            .accounts({
-            storageConfig,
-            storageAccount,
-            file: fileAccount,
-            stakeAccount,
-            owner: keypair.publicKey,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        loglevel_1.default.info(`Sending file delete request to cluster for file ${options.url}...`);
+        const deleteRequestBody = {
+            signer: keypair.publicKey.toString(),
+            message: signature,
+            location: options.url,
+        };
+        const deleteRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/delete-file`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(deleteRequestBody),
+        });
+        const deleteResponse = await deleteRequest.json();
     }
     catch (e) {
-        txnSpinner.fail("Failed to submit undelete file request. See below for details:");
-        return loglevel_1.default.error(e);
+        loglevel_1.default.error("Error with request");
+        loglevel_1.default.error(e);
     }
-    txnSpinner.succeed("File account undelete request submitted. Your file will no longer be removed.");
+    return loglevel_1.default.info(`File ${options.url} successfully deleted`);
 });
 programCommand("get-storage-account")
     .requiredOption("-kp, --keypair <string>", "Path to the keypair file for the wallet that you want to find storage accounts for.")
@@ -812,7 +696,7 @@ programCommand("get-storage-account")
     var _a;
     const keypair = (0, helpers_1.loadWalletKey)(path.resolve(options.keypair));
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
     const userInfoAccount = await connection.getAccountInfo(userInfo);
     if (userInfoAccount === null) {
@@ -829,201 +713,55 @@ programCommand("get-storage-account")
         ], programClient.programId);
         accountsToFetch.push(acc);
     }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
-    let alist1 = accounts.map((account, idx) => {
+    let storageAccounts = await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        return storageAccountDetailsJson;
+    }));
+    storageAccounts = storageAccounts.filter((account) => {
+        if (typeof account.identifier === "undefined" ||
+            account.identifier === null) {
+            return false;
+        }
+        else {
+            return true;
+        }
+    });
+    if (!storageAccounts.length) {
+        return loglevel_1.default.error("There are no active storage accounts for this wallet.");
+    }
+    let formattedAccounts = storageAccounts.map((account) => {
         return {
             identifier: account === null || account === void 0 ? void 0 : account.identifier,
-            initCounter: account === null || account === void 0 ? void 0 : account.initCounter,
-            delCounter: account === null || account === void 0 ? void 0 : account.delCounter,
-            deleteRequestTime: account === null || account === void 0 ? void 0 : account.deleteRequestTime,
             totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes)
                 : null,
             storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage)
                 : null,
-            storage: account === null || account === void 0 ? void 0 : account.storage,
             owner1: account === null || account === void 0 ? void 0 : account.owner1,
-            owner2: account === null || account === void 0 ? void 0 : account.owner2,
-            accountCounterSeed: account === null || account === void 0 ? void 0 : account.accountCounterSeed,
-            totalCostOfCurrentStorage: account === null || account === void 0 ? void 0 : account.totalCostOfCurrentStorage,
-            totalFeesPaid: account === null || account === void 0 ? void 0 : account.totalFeesPaid,
-            creationTime: account === null || account === void 0 ? void 0 : account.creationTime,
-            creationEpoch: account === null || account === void 0 ? void 0 : account.creationEpoch,
-            lastFeeEpoch: account === null || account === void 0 ? void 0 : account.lastFeeEpoch,
-            shdwPayer: account === null || account === void 0 ? void 0 : account.shdwPayer,
-            pubkey: accountsToFetch[idx],
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
+            creationTime: account === null || account === void 0 ? void 0 : account.creation_time,
+            creationEpoch: account === null || account === void 0 ? void 0 : account.creation_epoch,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
         };
     });
-    let formattedAccounts = alist1.filter((acc, idx) => {
-        if (acc.identifier) {
-            return acc;
-        }
-    });
-    const pickedAccount = await (0, prompts_1.default)({
-        type: "select",
-        name: "option",
-        message: "Which storage account do you want to get info for?",
-        choices: formattedAccounts.map((acc) => {
-            return {
-                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} available of ${acc.totalStorage} reserved`,
-            };
-        }),
-    });
-    if (typeof pickedAccount.option === "undefined") {
-        loglevel_1.default.error("You must pick a storage account to continue.");
-        return;
-    }
-    const storageAccount = formattedAccounts[pickedAccount.option];
-    const formattedStorageAccount = {
-        identifier: storageAccount.identifier,
-        initCounter: storageAccount.initCounter.toString(),
-        delCounter: storageAccount.delCounter.toString(),
-        deleteRequestTime: (_a = storageAccount.deleteRequestTime) === null || _a === void 0 ? void 0 : _a.toString(),
-        storage: storageAccount.storage.toString(),
-        storageAvailable: storageAccount.storageAvailable.toString(),
-        owner1: storageAccount.owner1.toString(),
-        owner2: storageAccount.owner2.toString(),
-        accountCounterSeed: storageAccount.accountCounterSeed.toString(),
-        totalCostOfCurrentStorage: storageAccount.totalCostOfCurrentStorage.toString(),
-        totalFeesPaid: storageAccount.totalFeesPaid.toString(),
-        creationTime: storageAccount.creationTime.toString(),
-        creationEpoch: storageAccount.creationEpoch.toString(),
-        lastFeeEpoch: storageAccount.lastFeeEpoch.toString(),
-        shdwPayer: storageAccount.shdwPayer.toString(),
-        toBeDeleted: storageAccount.toBeDeleted.toString(),
-    };
-    loglevel_1.default.info(`Information for storage account ${storageAccount.identifier} - ${accountsToFetch[pickedAccount.option]}:`);
-    loglevel_1.default.info(formattedStorageAccount);
-});
-programCommand("delete-storage-account")
-    .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account")
-    .action(async (options, cmd) => {
-    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
-    const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
-    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
-    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
-    const userInfoAccount = await connection.getAccountInfo(userInfo);
-    if (userInfoAccount === null) {
-        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
-    }
-    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
-    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
-    let accountsToFetch = [];
-    for (let i = 0; i <= numberOfStorageAccounts; i++) {
-        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
-            Buffer.from("storage-account"),
-            keypair.publicKey.toBytes(),
-            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
-        ], programClient.programId);
-        accountsToFetch.push(acc);
-    }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
-    let alist1 = accounts.map((account, idx) => {
-        return {
-            identifier: account === null || account === void 0 ? void 0 : account.identifier,
-            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
-                : null,
-            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
-                : null,
-            pubkey: accountsToFetch[idx],
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
-        };
-    });
-    let formattedAccounts = alist1.filter((acc, idx) => {
-        if (acc.identifier) {
-            return acc;
-        }
-    });
-    const pickedAccount = await (0, prompts_1.default)({
-        type: "select",
-        name: "option",
-        message: "Which storage account do you want to delete?",
-        choices: formattedAccounts.map((acc) => {
-            return {
-                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
-            };
-        }),
-    });
-    if (typeof pickedAccount.option === "undefined") {
-        loglevel_1.default.error("You must pick a storage account to add storage to.");
-        return;
-    }
-    const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
-    const storageAccountData = accounts[pickedAccount.option];
-    const [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
-    loglevel_1.default.debug({
-        storageAccount: storageAccount.toString(),
-    });
-    const txnSpinner = (0, ora_1.default)("Sending storage account deletion request. Subject to solana traffic conditions (w/ 120s timeout).").start();
-    try {
-        const transaction = await programClient.methods
-            .requestDeleteAccount()
-            .accounts({
-            storageConfig,
-            storageAccount,
-            owner: keypair.publicKey,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
-    }
-    catch (e) {
-        txnSpinner.fail("Error sending transaction. Please see information below.");
-        return loglevel_1.default.error(e);
-    }
-    txnSpinner.succeed(`Storage account deletion request successfully submitted for account ${storageAccount.toString()}. You have until the end of the current Solana Epoch to revert this account deletion request. Once the account is fully deleted, you will receive the SOL rent and SHDW staked back in your wallet.`);
-});
-programCommand("undelete-storage-account")
-    .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account")
-    .action(async (options, cmd) => {
-    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
-    const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
-    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
-    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
-    const userInfoAccount = await connection.getAccountInfo(userInfo);
-    if (userInfoAccount === null) {
-        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
-    }
-    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
-    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
-    let accountsToFetch = [];
-    for (let i = 0; i <= numberOfStorageAccounts; i++) {
-        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
-            Buffer.from("storage-account"),
-            keypair.publicKey.toBytes(),
-            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
-        ], programClient.programId);
-        accountsToFetch.push(acc);
-    }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
-    let alist1 = accounts.map((account, idx) => {
-        return {
-            identifier: account === null || account === void 0 ? void 0 : account.identifier,
-            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
-                : null,
-            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
-                : null,
-            pubkey: accountsToFetch[idx],
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
-        };
-    });
-    let formattedAccounts = alist1.filter((acc, idx) => {
-        if (acc.identifier) {
-            return acc;
-        }
-    });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
     const pickedAccount = await (0, prompts_1.default)({
         type: "select",
         name: "option",
@@ -1038,29 +776,271 @@ programCommand("undelete-storage-account")
         loglevel_1.default.error("You must pick a storage account to unmark for deletion.");
         return;
     }
+    const storageAccount = formattedAccounts[pickedAccount.option];
+    loglevel_1.default.info(`Information for storage account ${storageAccount.identifier} - ${(_a = storageAccount.pubkey) === null || _a === void 0 ? void 0 : _a.toString()}:`);
+    return loglevel_1.default.info(storageAccount);
+});
+programCommand("delete-storage-account")
+    .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account")
+    .action(async (options, cmd) => {
+    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
+    const connection = new anchor.web3.Connection(options.rpc);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
+    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
+    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
+    const userInfoAccount = await connection.getAccountInfo(userInfo);
+    if (userInfoAccount === null) {
+        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
+    }
+    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
+    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
+    let accountsToFetch = [];
+    for (let i = 0; i <= numberOfStorageAccounts; i++) {
+        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
+            Buffer.from("storage-account"),
+            keypair.publicKey.toBytes(),
+            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
+        ], programClient.programId);
+        accountsToFetch.push(acc);
+    }
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
+    let alist1 = accounts.map((account, idx) => {
+        return {
+            identifier: account === null || account === void 0 ? void 0 : account.identifier,
+            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
+                : null,
+            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
+                : null,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
+        };
+    });
+    let formattedAccounts = alist1.filter((acc, idx) => {
+        if (acc.identifier) {
+            return acc;
+        }
+    });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
+    const pickedAccount = await (0, prompts_1.default)({
+        type: "select",
+        name: "option",
+        message: "Which storage account do you want to delete?",
+        warn: "Account is marked immutable or is already requested to be deleted",
+        choices: formattedAccounts.map((acc) => {
+            return {
+                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining - ${acc.immutable ? "Immutable" : "Mutable"}`,
+                disabled: acc.immutable || acc.toBeDeleted,
+            };
+        }),
+    });
+    if (typeof pickedAccount.option === "undefined") {
+        loglevel_1.default.error("You must pick a storage account to add storage to.");
+        return;
+    }
     const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
-    const storageAccountData = accounts[pickedAccount.option];
+    const storageAccountData = formattedAccounts[pickedAccount.option];
+    const storageAccountType = await (0, helpers_1.validateStorageAccount)(storageAccount, connection);
+    if (!storageAccountType || storageAccountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount.toString()} is not a valid Shadow Drive Storage Account.`);
+    }
+    loglevel_1.default.debug({
+        storageAccount: storageAccount.toString(),
+    });
+    const txnSpinner = (0, ora_1.default)("Sending storage account deletion request. Subject to solana traffic conditions (w/ 120s timeout).").start();
+    try {
+        if (storageAccountType === "V1") {
+            const transaction = await programClient.methods
+                .requestDeleteAccount()
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                tokenMint: tokenMint,
+                systemProgram: anchor.web3.SystemProgram.programId,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.sign(keypair);
+            await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        }
+        if (storageAccountType === "V2") {
+            const transaction = await programClient.methods
+                .requestDeleteAccount2()
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                tokenMint: tokenMint,
+                systemProgram: anchor.web3.SystemProgram.programId,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.sign(keypair);
+            await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        }
+    }
+    catch (e) {
+        txnSpinner.fail("Error sending transaction. Please see information below.");
+        return loglevel_1.default.error(e);
+    }
+    txnSpinner.succeed(`Storage account deletion request successfully submitted for account ${storageAccount.toString()}. You have until the end of the current Solana Epoch to revert this account deletion request. Once the account is fully deleted, you will receive the SOL rent and SHDW staked back in your wallet.`);
+});
+programCommand("undelete-storage-account")
+    .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account")
+    .action(async (options, cmd) => {
+    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
+    const connection = new anchor.web3.Connection(options.rpc);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
+    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
+    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
+    const userInfoAccount = await connection.getAccountInfo(userInfo);
+    if (userInfoAccount === null) {
+        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
+    }
+    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
+    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
+    let accountsToFetch = [];
+    for (let i = 0; i <= numberOfStorageAccounts; i++) {
+        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
+            Buffer.from("storage-account"),
+            keypair.publicKey.toBytes(),
+            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
+        ], programClient.programId);
+        accountsToFetch.push(acc);
+    }
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
+    let alist1 = accounts.map((account, idx) => {
+        return {
+            identifier: account === null || account === void 0 ? void 0 : account.identifier,
+            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
+                : null,
+            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
+                : null,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
+        };
+    });
+    let formattedAccounts = alist1.filter((acc, idx) => {
+        if (acc.identifier) {
+            return acc;
+        }
+    });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
+    const pickedAccount = await (0, prompts_1.default)({
+        type: "select",
+        name: "option",
+        message: "Which storage account do you want to unmark for deletion?",
+        warn: "Account not marked for deletion",
+        choices: formattedAccounts.map((acc) => {
+            return {
+                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
+                disabled: !acc.toBeDeleted,
+            };
+        }),
+    });
+    if (typeof pickedAccount.option === "undefined") {
+        loglevel_1.default.error("You must pick a storage account to unmark for deletion.");
+        return;
+    }
+    const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
+    const storageAccountType = await (0, helpers_1.validateStorageAccount)(storageAccount, connection);
+    if (!storageAccountType || storageAccountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount.toString()} is not a valid Shadow Drive Storage Account.`);
+    }
     const [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
     loglevel_1.default.debug({
         storageAccount: storageAccount.toString(),
     });
     const txnSpinner = (0, ora_1.default)("Sending storage account undelete request. Subject to solana traffic conditions (w/ 120s timeout).").start();
     try {
-        const transaction = await programClient.methods
-            .unmarkDeleteAccount()
-            .accounts({
-            storageConfig,
-            storageAccount,
-            stakeAccount,
-            owner: keypair.publicKey,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        if (storageAccountType === "V1") {
+            const transaction = await programClient.methods
+                .unmarkDeleteAccount()
+                .accounts({
+                storageConfig,
+                storageAccount,
+                stakeAccount,
+                owner: keypair.publicKey,
+                tokenMint: tokenMint,
+                systemProgram: anchor.web3.SystemProgram.programId,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.sign(keypair);
+            await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        }
+        if (storageAccountType === "V2") {
+            const transaction = await programClient.methods
+                .unmarkDeleteAccount2()
+                .accounts({
+                storageConfig,
+                storageAccount,
+                stakeAccount,
+                owner: keypair.publicKey,
+                tokenMint: tokenMint,
+                systemProgram: anchor.web3.SystemProgram.programId,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.sign(keypair);
+            await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        }
     }
     catch (e) {
         txnSpinner.fail("Error sending transaction. Please see information below.");
@@ -1081,8 +1061,9 @@ programCommand("add-storage")
     loglevel_1.default.debug("storageInputAsBytes", storageInputAsBytes);
     const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
+    const emissionsAta = await (0, helpers_1.findAssociatedTokenAddress)(emissionsPubkey, tokenMint);
     let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
     const userInfoAccount = await connection.getAccountInfo(userInfo);
     if (userInfoAccount === null) {
@@ -1099,18 +1080,42 @@ programCommand("add-storage")
         ], programClient.programId);
         accountsToFetch.push(acc);
     }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
     let alist1 = accounts.map((account, idx) => {
         return {
             identifier: account === null || account === void 0 ? void 0 : account.identifier,
             totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
                 : null,
             storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
                 : null,
-            pubkey: accountsToFetch[idx],
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
         };
     });
     let formattedAccounts = alist1.filter((acc, idx) => {
@@ -1118,13 +1123,14 @@ programCommand("add-storage")
             return acc;
         }
     });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
     const pickedAccount = await (0, prompts_1.default)({
         type: "select",
         name: "option",
         message: "Which storage account do you want to add storage to?",
         choices: formattedAccounts.map((acc) => {
             return {
-                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
+                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.totalStorage} reserved - ${acc.storageAvailable} remaining - ${acc.immutable ? "Immutable" : "Mutable"}`,
             };
         }),
     });
@@ -1133,9 +1139,12 @@ programCommand("add-storage")
         return;
     }
     const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
-    const storageAccountData = accounts[pickedAccount.option];
+    let accountType = await (0, helpers_1.validateStorageAccount)(new web3_js_1.PublicKey(storageAccount), connection);
+    if (!accountType || accountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount} is not a valid Shadow Drive Storage Account.`);
+    }
+    const storageAccountData = formattedAccounts[pickedAccount.option];
     const [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
-    const stakeBalance = new anchor.BN((await provider.connection.getTokenAccountBalance(stakeAccount)).value.amount);
     const ownerAta = await (0, helpers_1.findAssociatedTokenAddress)(keypair.publicKey, tokenMint);
     loglevel_1.default.debug({
         storageAccount: storageAccount.toString(),
@@ -1144,132 +1153,177 @@ programCommand("add-storage")
     });
     const txnSpinner = (0, ora_1.default)("Sending add storage request. Subject to solana traffic conditions (w/ 120s timeout).").start();
     try {
-        const transaction = await programClient.methods
-            .increaseStorage(new anchor.BN(storageInputAsBytes.toString()))
-            .accounts({
-            storageConfig,
-            storageAccount,
-            owner: keypair.publicKey,
-            ownerAta,
-            stakeAccount,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-            tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        if (accountType === "V1" && !storageAccountData.immutable) {
+            const transaction = await programClient.methods
+                .increaseStorage(new anchor.BN(storageInputAsBytes.toString()))
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                stakeAccount,
+                tokenMint: tokenMint,
+                uploader: uploaderPubkey,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const addStorageRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/add-storage`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!addStorageRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${addStorageRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await addStorageRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await addStorageRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
+        if (accountType === "V1" && storageAccountData.immutable) {
+            const transaction = await programClient.methods
+                .increaseImmutableStorage(new anchor.BN(storageInputAsBytes.toString()))
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                tokenMint: tokenMint,
+                uploader: uploaderPubkey,
+                emissionsWallet: emissionsAta,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const addStorageRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/add-storage`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!addStorageRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${addStorageRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await addStorageRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await addStorageRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
+        if (accountType === "V2" && !storageAccountData.immutable) {
+            const transaction = await programClient.methods
+                .increaseStorage2(new anchor.BN(storageInputAsBytes.toString()))
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                stakeAccount,
+                tokenMint: tokenMint,
+                uploader: uploaderPubkey,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const addStorageRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/add-storage`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!addStorageRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${addStorageRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await addStorageRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await addStorageRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
+        if (accountType === "V2" && storageAccountData.immutable) {
+            const transaction = await programClient.methods
+                .increaseImmutableStorage2(new anchor.BN(storageInputAsBytes.toString()))
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                tokenMint: tokenMint,
+                uploader: uploaderPubkey,
+                emissionsWallet: emissionsAta,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const addStorageRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/add-storage`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!addStorageRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${addStorageRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await addStorageRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await addStorageRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
     }
     catch (e) {
         txnSpinner.fail("Error sending transaction. Please see information below.");
         return loglevel_1.default.error(e);
     }
-    const newAccountInfo = await programClient.account.storageAccount.fetch(storageAccount);
-    txnSpinner.succeed(`Storage account capacity successfully increased to ${(0, helpers_1.bytesToHuman)(newAccountInfo.storage, true, 2)} total with ${(0, helpers_1.bytesToHuman)(newAccountInfo.storageAvailable, true, 2)} currently available.`);
+    txnSpinner.succeed(`Storage account capacity successfully increased`);
     return;
 });
-programCommand("make-storage-account-immutable")
-    .requiredOption("-kp, --keypair <string>", "Path to wallet that you want to make immutable")
-    .action(async (options, cmd) => {
-    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
-    const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
-    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
-    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
-    const userInfoAccount = await connection.getAccountInfo(userInfo);
-    if (userInfoAccount === null) {
-        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
-    }
-    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
-    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
-    let accountsToFetch = [];
-    for (let i = 0; i <= numberOfStorageAccounts; i++) {
-        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
-            Buffer.from("storage-account"),
-            keypair.publicKey.toBytes(),
-            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
-        ], programClient.programId);
-        accountsToFetch.push(acc);
-    }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
-    let alist1 = accounts.map((account, idx) => {
-        return {
-            identifier: account === null || account === void 0 ? void 0 : account.identifier,
-            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
-                : null,
-            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
-                : null,
-            pubkey: accountsToFetch[idx],
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
-        };
-    });
-    let formattedAccounts = alist1.filter((acc, idx) => {
-        if (acc.identifier) {
-            return acc;
-        }
-    });
-    const pickedAccount = await (0, prompts_1.default)({
-        type: "select",
-        name: "option",
-        message: "Which storage account do you want to make immutable?",
-        choices: formattedAccounts.map((acc) => {
-            return {
-                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
-            };
-        }),
-    });
-    if (typeof pickedAccount.option === "undefined") {
-        loglevel_1.default.error("You must pick a storage account to make immutable.");
-        return;
-    }
-    const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
-    const storageAccountData = accounts[pickedAccount.option];
-    const [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
-    const stakeBalance = new anchor.BN((await provider.connection.getTokenAccountBalance(stakeAccount)).value.amount);
-    const ownerAta = await (0, helpers_1.findAssociatedTokenAddress)(keypair.publicKey, tokenMint);
-    const emissionsAta = await (0, helpers_1.findAssociatedTokenAddress)(emissionsPubkey, tokenMint);
-    loglevel_1.default.debug({
-        storageAccount: storageAccount.toString(),
-        stakeAccount: stakeAccount.toString(),
-        ownerAta: ownerAta.toString(),
-        emissionsAta: emissionsAta.toString(),
-    });
-    const txnSpinner = (0, ora_1.default)("Sending make account immutable request. Subject to solana traffic conditions (w/ 120s timeout).").start();
-    try {
-        const transaction = await programClient.methods
-            .makeAccountImmutable()
-            .accounts({
-            storageConfig,
-            storageAccount,
-            owner: keypair.publicKey,
-            ownerAta,
-            stakeAccount,
-            emissionsWallet: emissionsAta,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-            tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
-            associatedTokenProgram: spl_token_1.ASSOCIATED_TOKEN_PROGRAM_ID,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
-    }
-    catch (e) {
-        txnSpinner.fail("Error sending transaction. Please see information below.");
-        return loglevel_1.default.error(e);
-    }
-    const newAccountInfo = await programClient.account.storageAccount.fetch(storageAccount);
-    txnSpinner.succeed(`Storage account ${storageAccount.toString()} has been marked as immutable. Files can no longer be deleted from this storage account.`);
-});
 programCommand("reduce-storage")
-    .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account you want to reduce.")
-    .requiredOption("-s, --size <string>", "Amount of storage you are requesting to reduce from your storage account. Should be in a string like '1KB', '1MB', '1GB'. Only KB, MB, and GB storage delineations are supported currently.")
+    .requiredOption("-kp, --keypair <string>", "Path to wallet that will upload the files")
+    .requiredOption("-s, --size <string>", "Amount of storage you are requesting to remove from your storage account. Should be in a string like '1KB', '1MB', '1GB'. Only KB, MB, and GB storage delineations are supported currently.")
     .action(async (options, cmd) => {
     let storageInput = options.size;
     let storageInputAsBytes = (0, helpers_1.humanSizeToBytes)(storageInput);
@@ -1280,9 +1334,204 @@ programCommand("reduce-storage")
     loglevel_1.default.debug("storageInputAsBytes", storageInputAsBytes);
     const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
+    let [storageConfig] = await (0, helpers_1.getStorageConfigPDA)(programClient);
+    let [userInfo] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
+    const userInfoAccount = await connection.getAccountInfo(userInfo);
+    if (userInfoAccount === null) {
+        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
+    }
+    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
+    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
+    let accountsToFetch = [];
+    for (let i = 0; i <= numberOfStorageAccounts; i++) {
+        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
+            Buffer.from("storage-account"),
+            keypair.publicKey.toBytes(),
+            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
+        ], programClient.programId);
+        accountsToFetch.push(acc);
+    }
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
+    let alist1 = accounts.map((account, idx) => {
+        return {
+            identifier: account === null || account === void 0 ? void 0 : account.identifier,
+            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
+                : null,
+            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
+                : null,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
+        };
+    });
+    let formattedAccounts = alist1.filter((acc, idx) => {
+        if (acc.identifier) {
+            return acc;
+        }
+    });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
+    const pickedAccount = await (0, prompts_1.default)({
+        type: "select",
+        name: "option",
+        message: "Which storage account do you want to remove storage from?",
+        warn: "Account is marked for deletion or is immutable.",
+        choices: formattedAccounts.map((acc) => {
+            return {
+                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.totalStorage} reserved - ${acc.storageAvailable} remaining - ${acc.immutable ? "Immutable" : "Mutable"}`,
+                disabled: acc.toBeDeleted || acc.immutable,
+            };
+        }),
+    });
+    if (typeof pickedAccount.option === "undefined") {
+        loglevel_1.default.error("You must pick a storage account to remove storage from.");
+        return;
+    }
+    const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
+    const storageAccountType = await (0, helpers_1.validateStorageAccount)(storageAccount, connection);
+    if (!storageAccountType || storageAccountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount.toString()} is not a valid Shadow Drive Storage Account.`);
+    }
+    const [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
+    const ownerAta = await (0, helpers_1.findAssociatedTokenAddress)(keypair.publicKey, tokenMint);
+    const [unstakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("unstake-account"), storageAccount.toBytes()], programClient.programId);
+    const [unstakeInfo] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("unstake-info"), storageAccount.toBytes()], programClient.programId);
+    const emissionsAta = await (0, helpers_1.findAssociatedTokenAddress)(emissionsPubkey, tokenMint);
+    loglevel_1.default.debug({
+        storageAccount: storageAccount.toString(),
+        stakeAccount: stakeAccount.toString(),
+        ownerAta: ownerAta.toString(),
+    });
+    const txnSpinner = (0, ora_1.default)("Sending reduce storage request. Subject to solana traffic conditions (w/ 120s timeout).").start();
+    try {
+        if (storageAccountType === "V1") {
+            const transaction = await programClient.methods
+                .decreaseStorage(new anchor.BN(storageInputAsBytes.toString()))
+                .accounts({
+                storageConfig,
+                storageAccount,
+                unstakeInfo,
+                unstakeAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                stakeAccount,
+                emissionsWallet: emissionsAta,
+                tokenMint: tokenMint,
+                uploader: uploaderPubkey,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+                rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const addStorageRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/reduce-storage`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!addStorageRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${addStorageRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await addStorageRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await addStorageRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
+        if (storageAccountType === "V2") {
+            const transaction = await programClient.methods
+                .decreaseStorage2(new anchor.BN(storageInputAsBytes.toString()))
+                .accounts({
+                storageConfig,
+                storageAccount,
+                unstakeInfo,
+                unstakeAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                stakeAccount,
+                emissionsWallet: emissionsAta,
+                tokenMint: tokenMint,
+                uploader: uploaderPubkey,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+                rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const addStorageRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/reduce-storage`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!addStorageRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${addStorageRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await addStorageRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await addStorageRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
+    }
+    catch (e) {
+        txnSpinner.fail("Error sending transaction. Please see information below.");
+        return loglevel_1.default.error(e);
+    }
+    txnSpinner.succeed(`Storage account capacity successfully reduced.`);
+    return;
+});
+programCommand("make-storage-account-immutable")
+    .requiredOption("-kp, --keypair <string>", "Path to wallet that you want to make immutable")
+    .action(async (options, cmd) => {
+    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
+    const connection = new anchor.web3.Connection(options.rpc);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
-    const storageConfigData = await programClient.account.storageConfig.fetch(storageConfig);
     let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
     const userInfoAccount = await connection.getAccountInfo(userInfo);
     if (userInfoAccount === null) {
@@ -1299,18 +1548,39 @@ programCommand("reduce-storage")
         ], programClient.programId);
         accountsToFetch.push(acc);
     }
-    let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                storage_account: account.toString(),
+            }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
     let alist1 = accounts.map((account, idx) => {
         return {
             identifier: account === null || account === void 0 ? void 0 : account.identifier,
             totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
                 : null,
-            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
                 : null,
-            pubkey: accountsToFetch[idx],
-            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
         };
     });
     let formattedAccounts = alist1.filter((acc, idx) => {
@@ -1318,71 +1588,136 @@ programCommand("reduce-storage")
             return acc;
         }
     });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
     const pickedAccount = await (0, prompts_1.default)({
         type: "select",
         name: "option",
-        message: "Which storage account do you want to reduce storage on?",
+        message: "Which storage account do you want to make immutable?",
+        warn: "Account already immutable",
         choices: formattedAccounts.map((acc) => {
             return {
-                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
+                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.totalStorage} reserved. ${acc.immutable ? "Immutable" : "Mutable"}`,
+                disabled: acc.immutable,
             };
         }),
     });
     if (typeof pickedAccount.option === "undefined") {
-        loglevel_1.default.error("You must pick a storage account to reduce storage on.");
+        loglevel_1.default.error("You must pick a storage account to make immutable.");
         return;
     }
     const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
-    const storageAccountData = accounts[pickedAccount.option];
-    let [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
-    const [unstakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("unstake-account"), storageAccount.toBytes()], programClient.programId);
-    const [unstakeInfo] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("unstake-info"), storageAccount.toBytes()], programClient.programId);
+    const storageAccountType = await (0, helpers_1.validateStorageAccount)(storageAccount, connection);
+    if (!storageAccountType || storageAccountType === null) {
+        return loglevel_1.default.error(`Storage account ${storageAccount.toString()} is not a valid Shadow Drive Storage Account.`);
+    }
+    const [stakeAccount] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("stake-account"), storageAccount.toBytes()], programClient.programId);
     const ownerAta = await (0, helpers_1.findAssociatedTokenAddress)(keypair.publicKey, tokenMint);
     const emissionsAta = await (0, helpers_1.findAssociatedTokenAddress)(emissionsPubkey, tokenMint);
     loglevel_1.default.debug({
         storageAccount: storageAccount.toString(),
-        unstakeAccount: unstakeAccount.toString(),
-        unstakeInfo: unstakeInfo.toString(),
-        ownerAta: ownerAta.toString(),
         stakeAccount: stakeAccount.toString(),
+        ownerAta: ownerAta.toString(),
+        emissionsAta: emissionsAta.toString(),
     });
-    const txnSpinner = (0, ora_1.default)("Sending reduce storage request. Subject to solana traffic conditions (w/ 120s timeout).").start();
+    const txnSpinner = (0, ora_1.default)("Sending make account immutable request. Subject to solana traffic conditions (w/ 120s timeout).").start();
     try {
-        const transaction = await programClient.methods
-            .decreaseStorage(new anchor.BN(storageInputAsBytes.toString()))
-            .accounts({
-            storageConfig,
-            storageAccount,
-            unstakeInfo,
-            unstakeAccount,
-            owner: keypair.publicKey,
-            ownerAta,
-            stakeAccount,
-            emissionsWallet: emissionsAta,
-            tokenMint: tokenMint,
-            systemProgram: anchor.web3.SystemProgram.programId,
-            tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
-            rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-        })
-            .transaction();
-        transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
-        transaction.feePayer = keypair.publicKey;
-        transaction.sign(keypair);
-        await (0, transaction_1.sendAndConfirm)(provider.connection, transaction.serialize(), { skipPreflight: false }, "max", 120000);
+        if (storageAccountType === "V1") {
+            const transaction = await programClient.methods
+                .makeAccountImmutable()
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                stakeAccount,
+                uploader: uploaderPubkey,
+                emissionsWallet: emissionsAta,
+                tokenMint: tokenMint,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+                associatedTokenProgram: spl_token_1.ASSOCIATED_TOKEN_PROGRAM_ID,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const makeImmutableRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/make-immutable`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!makeImmutableRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${makeImmutableRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await makeImmutableRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await makeImmutableRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
+        if (storageAccountType === "V2") {
+            const transaction = await programClient.methods
+                .makeAccountImmutable2()
+                .accounts({
+                storageConfig,
+                storageAccount,
+                owner: keypair.publicKey,
+                ownerAta,
+                stakeAccount,
+                uploader: uploaderPubkey,
+                emissionsWallet: emissionsAta,
+                tokenMint: tokenMint,
+                systemProgram: anchor.web3.SystemProgram.programId,
+                tokenProgram: spl_token_1.TOKEN_PROGRAM_ID,
+                associatedTokenProgram: spl_token_1.ASSOCIATED_TOKEN_PROGRAM_ID,
+            })
+                .transaction();
+            transaction.recentBlockhash = (await connection.getLatestBlockhash("finalized")).blockhash;
+            transaction.feePayer = keypair.publicKey;
+            transaction.partialSign(keypair);
+            const serializedTransaction = transaction.serialize({
+                requireAllSignatures: false,
+            });
+            const makeImmutableRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/make-immutable`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    transaction: Buffer.from(serializedTransaction.toJSON().data).toString("base64"),
+                    commitment: "finalized",
+                }),
+            });
+            if (!makeImmutableRequest.ok) {
+                txnSpinner.fail("Error processing transaction. See below for details:");
+                loglevel_1.default.error(`Server response status code: ${makeImmutableRequest.status}`);
+                loglevel_1.default.error(`Server response status message: ${(await makeImmutableRequest.json()).error}`);
+                return;
+            }
+            const responseJson = await makeImmutableRequest.json();
+            loglevel_1.default.debug(responseJson);
+        }
     }
     catch (e) {
         txnSpinner.fail("Error sending transaction. Please see information below.");
         return loglevel_1.default.error(e);
     }
-    const newAccountInfo = await programClient.account.storageAccount.fetch(storageAccount);
-    txnSpinner.succeed(`Storage account capacity successfully decreased to ${(0, helpers_1.bytesToHuman)(newAccountInfo.storage, true, 2)} total with ${(0, helpers_1.bytesToHuman)(newAccountInfo.storageAvailable, true, 2)} currently available.\nPlease see the "claim-stake" command to recover the stake from this reduction request.`);
+    txnSpinner.succeed(`Storage account ${storageAccount.toString()} has been marked as immutable. Files can no longer be deleted from this storage account.`);
 });
 programCommand("claim-stake")
     .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account you want to claim available stake from.")
     .action(async (options, cmd) => {
     const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
     const connection = new anchor.web3.Connection(options.rpc);
-    const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
     let programConstants = Object.assign({}, ...programClient.idl.constants.map((x) => ({ [x.name]: x.value })));
     let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
     const storageConfigData = await programClient.account.storageConfig.fetch(storageConfig);
@@ -1405,7 +1740,7 @@ programCommand("claim-stake")
         ], programClient.programId);
         accountsToFetch.push(acc);
     }
-    let accounts = await (await programClient.account.storageAccount.fetchMultiple(accountsToFetch))
+    let accounts = await (await programClient.account.storageAccountV2.fetchMultiple(accountsToFetch))
         .filter((acc, idx) => {
         if (acc) {
             return acc;
@@ -1448,7 +1783,6 @@ programCommand("claim-stake")
         return {
             identifier: account.identifier,
             totalStorage: (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2),
-            storageAvailable: (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2),
             pubkey: accountsToFetch[idx],
             unstakeAccount: unstakeAccount,
             unstakeInfoAccount: unstakeInfo,
@@ -1510,112 +1844,262 @@ programCommand("claim-stake")
         console.log(e);
     }
 });
-programCommand("show-files")
-     .requiredOption("-kp, --keypair <string>", "Path to the keypair file for the wallet that you want to find storage accounts for.")
-     .action(async (options, cmd) => {
-     const keypair = (0, helpers_1.loadWalletKey)(path.resolve(options.keypair));
-     const connection = new anchor.web3.Connection(options.rpc);
-     const [programClient, provider] = (0, helpers_1.getAnchorEnvironmet)(keypair, connection);
-     let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
-     const userInfoAccount = await connection.getAccountInfo(userInfo);
-     if (userInfoAccount === null) {
-         return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
-     }
-     let userInfoData = await programClient.account.userInfo.fetch(userInfo);
-     let numberOfStorageAccounts = userInfoData.accountCounter - 1;
-     let accountsToFetch = [];
-     for (let i = 0; i <= numberOfStorageAccounts; i++) {
-         let [acc] = await anchor.web3.PublicKey.findProgramAddress([
-             Buffer.from("storage-account"),
-             keypair.publicKey.toBytes(),
-             new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
-         ], programClient.programId);
-         accountsToFetch.push(acc);
-     }
-     let accounts = await programClient.account.storageAccount.fetchMultiple(accountsToFetch);
-     accountsToFetch.forEach((accountPubkey, i) => {
-         if (accounts[i]) {
-             accounts[i].pubkey = accountPubkey;
-         }
-     });
-     let alist1 = accounts.map((account, idx) => {
-         return {
-             identifier: account === null || account === void 0 ? void 0 : account.identifier,
-             totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
-                 ? (0, helpers_1.bytesToHuman)(account.storage.toNumber(), true, 2)
-                 : null,
-             storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
-                 ? (0, helpers_1.bytesToHuman)(account.storageAvailable.toNumber(), true, 2)
-                 : null,
-             pubkey: accountsToFetch[idx],
-             toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.toBeDeleted : null,
-             initCounter: (account === null || account === void 0 ? void 0 : account.identifier) ? account.initCounter : null,
-         };
-     });
-     let formattedAccounts = alist1.filter((acc, inx) => {
-         if (acc.identifier) {
-             return acc;
-         }
-     });
-     let storageAccount;
-     let storageAccountData;
-     if (!options.storageAccount) {
-         const pickedAccount = await (0, prompts_1.default)({
-             type: "select",
-             name: "option",
-             message: "Which storage account do you want to see the contents of?",
-             warn: "This account or the account is marked for deletion",
-             choices: formattedAccounts.map((acc) => {
-                 return {
-                     title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
-                     disabled: acc.toBeDeleted,
-                 };
-             }),
-         });
-         if (typeof pickedAccount.option === "undefined") {
-             loglevel_1.default.error("You must pick a storage account to show.");
-             return;
-         }
-         storageAccount = formattedAccounts[pickedAccount.option].pubkey;
-         storageAccountData = formattedAccounts[pickedAccount.option];
-     }
-     const fileSpinner = (0, ora_1.default)("Attempting to retrieve files").start();
-     let allObjectsRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/list-objects`, {
-         method: "POST",
-         headers: {
-             "Content-Type": "application/json",
-         },
-         body: JSON.stringify({
-             storageAccount: storageAccount.toString(),
-         }),
-     });
-     const allObjects = await allObjectsRequest.json();
-    
-     const files = []
-    for (const file of allObjects.keys) {
-        const fileUrl = `https://shdw-drive.genesysgo.net/${storageAccount.toString()}/${file}`;
-        const fileData = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/get-object-data`, {
+programCommand("redeem-file-account-rent")
+    .requiredOption("-kp, --keypair <string>", "Path to wallet that owns the storage account you want to claim available stake from.")
+    .action(async (options, cmd) => {
+    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
+    const connection = new anchor.web3.Connection(options.rpc);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
+    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
+    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
+    const userInfoAccount = await connection.getAccountInfo(userInfo);
+    if (userInfoAccount === null) {
+        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
+    }
+    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
+    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
+    let accountsToFetch = [];
+    for (let i = 0; i <= numberOfStorageAccounts; i++) {
+        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
+            Buffer.from("storage-account"),
+            keypair.publicKey.toBytes(),
+            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
+        ], programClient.programId);
+        accountsToFetch.push(acc);
+    }
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({
-                location: fileUrl,
+                storage_account: account.toString(),
             }),
         });
-        const fileDataResponse = await fileData.json();
-        const fileAccount = new anchor.web3.PublicKey(fileDataResponse.file_data["file-account-pubkey"]);
-        const fileAccountOnChain = await programClient.account.file.fetch(fileAccount);
-        const fileSize = await (0, helpers_1.bytesToHuman)(fileAccountOnChain.size, true, 2);
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
+    let alist1 = accounts.map((account, idx) => {
+        return {
+            identifier: account === null || account === void 0 ? void 0 : account.identifier,
+            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
+                : null,
+            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
+                : null,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
+        };
+    });
+    let formattedAccounts = alist1.filter((acc, idx) => {
+        if (acc.identifier && acc.version === "V1") {
+            return acc;
+        }
+    });
+    formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
+    const pickedAccount = await (0, prompts_1.default)({
+        type: "select",
+        name: "option",
+        message: "Which storage account do you want to unmark for deletion?",
+        choices: formattedAccounts.map((acc) => {
+            return {
+                title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
+            };
+        }),
+    });
+    if (typeof pickedAccount.option === "undefined") {
+        loglevel_1.default.error("You must pick a storage account to unmark for deletion.");
+        return;
+    }
+    const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
+    const agrees = await (0, prompts_1.default)({
+        type: "confirm",
+        name: "confirm",
+        message: `Warning: this will delete all on-chain file accounts associated with the storage account ${storageAccount.toString()} in order to reclaim the SOL rent. Your data/files will not be removed from Shadow Drive.`,
+        initial: false,
+    });
+    if (!agrees.confirm) {
+        return loglevel_1.default.error("You must confirm before moving forward.");
+    }
+    const onchainStorageAccountInfo = await programClient.account.storageAccount.fetch(storageAccount);
+    const numberOfFiles = onchainStorageAccountInfo.initCounter;
+    let filePubkeys = [];
+    for (let i = 0; i < numberOfFiles; i++) {
+        const fileSeed = new anchor.BN(i);
+        let [file] = anchor.web3.PublicKey.findProgramAddressSync([
+            storageAccount.toBytes(),
+            fileSeed.toTwos(64).toArrayLike(Buffer, "le", 4),
+        ], programClient.programId);
+        let fileAccountInfo = await connection.getAccountInfo(file);
+        if (fileAccountInfo) {
+            filePubkeys.push(file);
+        }
+    }
+    const progress = new cli_progress_1.default.SingleBar({
+        format: "Progress | {bar} | {percentage}% || {value}/{total} file accounts closed",
+        barCompleteChar: "\u2588",
+        barIncompleteChar: "\u2591",
+        hideCursor: true,
+    });
+    progress.start(filePubkeys.length, 0);
+    await Promise.all(filePubkeys.map(async (pubkey) => {
+        try {
+            await programClient.methods
+                .redeemRent()
+                .accounts({
+                storageAccount,
+                file: pubkey,
+                owner: keypair.publicKey,
+            })
+                .signers([keypair])
+                .rpc({ commitment: "processed" });
+            progress.increment(1);
+        }
+        catch (e) {
+            loglevel_1.default.error("Error with transaction, see below for details");
+            loglevel_1.default.error(e);
+        }
+    }));
+    progress.stop();
+    loglevel_1.default.info(`Successfully reclaimed rent from all file accounts in storage account ${storageAccount.toString()}`);
+});
+programCommand("show-files")
+    .requiredOption("-kp, --keypair <string>", "Path to the keypair file for the wallet you would like to find storage accounts for.")
+    .action(async (options, cmd) => {
+    const keypair = (0, helpers_1.loadWalletKey)(options.keypair);
+    const connection = new anchor.web3.Connection(options.rpc);
+    const [programClient, provider] = (0, helpers_1.getAnchorEnvironment)(keypair, connection);
+    let [storageConfig, storageConfigBump] = await (0, helpers_1.getStorageConfigPDA)(programClient);
+    let [userInfo, userInfoBump] = await anchor.web3.PublicKey.findProgramAddress([Buffer.from("user-info"), keypair.publicKey.toBytes()], programClient.programId);
+    const userInfoAccount = await connection.getAccountInfo(userInfo);
+    if (userInfoAccount === null) {
+        return loglevel_1.default.error("You have not created a storage account on Shadow Drive yet. Please see the 'create-storage-account' command to get started.");
+    }
+    let userInfoData = await programClient.account.userInfo.fetch(userInfo);
+    let numberOfStorageAccounts = userInfoData.accountCounter - 1;
+    let accountsToFetch = [];
+    for (let i = 0; i <= numberOfStorageAccounts; i++) {
+        let [acc] = await anchor.web3.PublicKey.findProgramAddress([
+            Buffer.from("storage-account"),
+            keypair.publicKey.toBytes(),
+            new anchor.BN(i).toTwos(0).toArrayLike(Buffer, "le", 4),
+        ], programClient.programId);
+        accountsToFetch.push(acc);
+    }
+    let accounts = [];
+    await Promise.all(accountsToFetch.map(async (account) => {
+        const storageAccountDetails = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/storage-account-info`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body:
+             JSON.stringify({
+                 storage_account: account.toString(),
+             }),
+        });
+        const storageAccountDetailsJson = await storageAccountDetails.json();
+        if (storageAccountDetailsJson.identifier !== null &&
+            typeof storageAccountDetailsJson.identifier !== "undefined") {
+            accounts.push(storageAccountDetailsJson);
+        }
+        return storageAccountDetailsJson;
+    }));
+    let alist1 = accounts.map((account, idx) => {
+        return{
+            identifier: account === null || account === void 0 ? void 0 : account.identifier,
+            totalStorage: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes, true, 2)
+                : null,
+            storageAvailable: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? (0, helpers_1.bytesToHuman)(account.reserved_bytes - account.current_usage, true, 2)
+                : null,
+            pubkey: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? new anchor.web3.PublicKey(account.storage_account)
+                : null,
+            toBeDeleted: (account === null || account === void 0 ? void 0 : account.identifier) ? account.to_be_deleted : null,
+            immutable: (account === null || account === void 0 ? void 0 : account.identifier) ? account.immutable : null,
+            version: (account === null || account === void 0 ? void 0 : account.identifier) ? account.version : null,
+            accountCounterSeed: (account === null || account === void 0 ? void 0 : account.identifier)
+                ? account.account_counter_seed
+                : null,
+        };
+    });
+    let formattedAccounts = alist1.filter((acc, idx) => {
+        if (acc.identifier) {
+            return acc;
+        }
+    });
+    let storageAccount;
+    let storageAccountData;
+    if (!options.storageAccount) {
+        const pickedAccount = await (0, prompts_1.default)({
+            type: "select",
+            name: "option",
+            message: "Which storage account do you want to see the contents of?\n",
+            warn: "This account is marked for deletion",
+            choices: formattedAccounts.map((acc) => {
+                return{
+                    title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} available - ${acc.version}`,
+                    disabled: acc.toBeDeleted,
+                };
+            }),
+        });
+        if (typeof pickedAccount.option === "undefined") {
+            loglevel_1.default.error("You must pick a storage account to show.");
+            return;
+        }
+        storageAccount = formattedAccounts[pickedAccount.option].pubkey;
+        storageAccountData = formattedAccounts[pickedAccount.option];
+    }
+    const fileSpinner = (0, ora_1.default)("Attempting to retrieve files").start();
+    let allObjectsRequest = await (0, node_fetch_1.default)(`${constants_1.SHDW_DRIVE_ENDPOINT}/list-objects`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            storageAccount: storageAccount.toString(),
+        }),
+    });
+    if (!allObjectsRequest.status) {
+        loglevel_1.default.error("Error getting a list of existing files. See details below and try your batch upload request again.");
+        loglevel_1.default.error(`Response status: ${allObjectsRequest.status}`);
+        loglevel_1.default.error(`Response message: ${(await allObjectsRequest.json()).error}`);
+        return;
+    }
+    const allObjects = await allObjectsRequest.json();
+    const files =[];
+    for (const file of allObjects.keys) {
+        const fileUrl = `https://shdw-drive.genesysgo.net/${storageAccount.toString()}/${file}`;
+        const fileData = await (0, node_fetch_1.default)(fileUrl, {
+            method: "GET",
+            headers: {
+            },
+        });
+        const fileSize = (0, helpers_1.bytesToHuman)(fileData.headers.get("Content-Length"));
         files.push({file: file,
                     size: fileSize});
     }
     function repeateString(string, times) {
-        if (times < 0 ) {
-            console.log('made it');
+        if (times < 0) {
             return "";
         }
-        if (times === 1) {
+        if (times === 0) {
             return string;
         }
         else {
@@ -1623,10 +2107,10 @@ programCommand("show-files")
         }
     }
     fileSpinner.succeed("\n-------Found the following files-------\n");
-    for (let i =0; i < files.length; i++) {
-        loglevel_1.default.info(`${files[i].file}${repeateString(".", 32 - files[i].file.length)}${files[i].size}`);
+    for (let i = 0; i < files.length; i++) {
+        loglevel_1.default.info(`${files[i].file}${repeateString(".", 42 - files[i].file.length)}${files[i].size}`);
     };
-     });
+    });
 function programCommand(name) {
     let shdwProgram = commander_1.program
         .command(name)
