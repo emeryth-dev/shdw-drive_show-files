@@ -60,7 +60,7 @@ const SHDW_DECIMALS = 9;
 const tokenMint = new anchor.web3.PublicKey("SHDWyBxihqiCj6YekG2GUr7wqKLeLAMK1gHZck9pL6y");
 const uploaderPubkey = new anchor.web3.PublicKey("972oJTFyjmVNsWM4GHEGPWUomAiJf2qrVotLtwnKmWem");
 const emissionsPubkey = new anchor.web3.PublicKey("SHDWRWMZ6kmRG9CvKFSD7kVcnUqXMtd3SaMrLvWscbj");
-commander_1.program.version("0.1.1");
+commander_1.program.version("0.2.2");
 commander_1.program.description("CLI for interacting with Shade Drive. This tool uses Solana's Mainnet-Beta network with an internal RPC configuration. It does not use your local Solana configurations.");
 loglevel_1.default.setLevel(loglevel_1.default.levels.INFO);
 loglevel_1.default.info("This is beta software running on Solana's Mainnet. Use at your own discretion.");
@@ -278,6 +278,7 @@ programCommand("edit-file")
     fd.append("signer", keypair.publicKey.toString());
     fd.append("message", signature);
     fd.append("storage_account", storageAccount.toString());
+    fd.append("url", options.url);
     try {
     }
     catch (e) {
@@ -415,7 +416,6 @@ async function handleUpload(options, cmd, mode) {
     formattedAccounts = formattedAccounts.sort((0, helpers_1.sortByProperty)("accountCounterSeed"));
     let storageAccount;
     let storageAccountData;
-    debugger;
     if (!options.storageAccount) {
         const pickedAccount = await (0, prompts_1.default)({
             type: "select",
@@ -436,12 +436,13 @@ async function handleUpload(options, cmd, mode) {
         storageAccountData = formattedAccounts[pickedAccount.option];
     }
     else {
-        storageAccount = new web3_js_1.PublicKey(options.storageAccount);
+        storageAccount = options.storageAccount;
         storageAccountData = alist1.find((account) => {
+            const accountPubkey = new web3_js_1.PublicKey(account.pubkey);
             if (account &&
-                account.pubkey &&
-                account.pubkey instanceof web3_js_1.PublicKey) {
-                return account.pubkey.equals(storageAccount);
+                accountPubkey &&
+                accountPubkey instanceof web3_js_1.PublicKey) {
+                return accountPubkey.equals(new web3_js_1.PublicKey(storageAccount));
             }
             return false;
         });
@@ -560,8 +561,6 @@ async function handleUpload(options, cmd, mode) {
                 contentType: item.contentType,
                 filename: item.fileName,
             });
-            console.log(fd);
-
         }
         const msg = `Shadow Drive Signed Message:\nStorage Account: ${storageAccount}\nUpload files with hash: ${fileNamesHashed}`;
         const signature = (0, helpers_1.signMessage)(msg, keypair);
@@ -606,8 +605,8 @@ async function handleUpload(options, cmd, mode) {
     }, concurrent), (0, rxjs_1.tap)((res) => progress.increment(res.length)), (0, rxjs_1.toArray)(), (0, rxjs_1.map)((res) => res.flat()))
         .subscribe((results) => {
         fs.writeFileSync(logPath, JSON.stringify(results));
-        loglevel_1.default.info(`${results.length} files uploaded.`);
         progress.stop();
+        loglevel_1.default.info(`${results.length} files uploaded.`);
     });
 }
 programCommand("upload-multiple-files")
@@ -765,7 +764,7 @@ programCommand("get-storage-account")
     const pickedAccount = await (0, prompts_1.default)({
         type: "select",
         name: "option",
-        message: "Which storage account do you want to unmark for deletion?",
+        message: "Which storage account do you want to get?",
         choices: formattedAccounts.map((acc) => {
             return {
                 title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
@@ -773,7 +772,7 @@ programCommand("get-storage-account")
         }),
     });
     if (typeof pickedAccount.option === "undefined") {
-        loglevel_1.default.error("You must pick a storage account to unmark for deletion.");
+        loglevel_1.default.error("You must pick a storage account to get.");
         return;
     }
     const storageAccount = formattedAccounts[pickedAccount.option];
@@ -1914,7 +1913,7 @@ programCommand("redeem-file-account-rent")
     const pickedAccount = await (0, prompts_1.default)({
         type: "select",
         name: "option",
-        message: "Which storage account do you want to unmark for deletion?",
+        message: "Which storage account do you want to redeem all file rent from?",
         choices: formattedAccounts.map((acc) => {
             return {
                 title: `${acc.identifier} - ${acc.pubkey.toString()} - ${acc.storageAvailable} remaining`,
@@ -1922,7 +1921,7 @@ programCommand("redeem-file-account-rent")
         }),
     });
     if (typeof pickedAccount.option === "undefined") {
-        loglevel_1.default.error("You must pick a storage account to unmark for deletion.");
+        loglevel_1.default.error("You must pick a storage account to redeem file rent from.");
         return;
     }
     const storageAccount = formattedAccounts[pickedAccount.option].pubkey;
